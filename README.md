@@ -823,9 +823,9 @@ def vit_huge_patch14_224_in21k(num_classes: int = 21843):
 
 
 
+# 具体实践项目
 
-
-
+基于ViT的植物病害识别：https://github.com/hide-self/myViT_PlantLeafDisease_Classify
 
 
 
