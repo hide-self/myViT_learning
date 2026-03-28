@@ -1,4 +1,4 @@
-# ViT原理
+# ViT原理与模型代码学习
 
 本仓库用于存放ViT原理的笔记，实战部分链接见本仓库底部的链接
 
@@ -437,6 +437,393 @@ class Attention(nn.Module):
         x = self.proj_drop(x)   # 随机失活
         return x
 ```
+
+
+
+
+
+## 前馈神经网络
+
+**ViT的主干部分**
+
+
+
+ViT的主干部分由N个Encoder编码器组成，而一个编码器由多头自注意力机制、前馈神经网络组成
+
+![77458952634](imgs/1774589526340.png)
+
+
+
+其中1个Encoder的输入矩阵形状变化如下：首先输入197x768大小的ptach embedds,经过层归一化LN后获得大小仍然是197x768，将它输入到多头注意力机制中，获得矩阵大小仍然是197x768，之后进行残差连接获得大小仍然是197x768的矩阵，将它输入层归一化LN后获得带下197x768矩阵，最后通过MLP获得197x768矩阵，最后通过残差连接完成编码器任务。总体而言，Encoder大框架下每一步输出都是197x768矩阵。
+
+![77459037992](imgs/1774590379921.png)
+
+
+
+
+
+### 前馈神经网络原理
+
+补充一点，Linear层的3072相当于4x768，作为2的倍数比较好进行计算
+
+![77459045218](D:\myViT_learning\imgs\1774590452180.png)
+
+
+
+
+
+
+
+
+
+### 前馈神经网络代码
+
+```python
+# 前馈神经网络
+class Mlp(nn.Module):
+    """
+    ViT的Encoder中的前馈神经网络Mlp
+    前馈神经网络整体结果:Linear->GELU->Dropout->Linear->Dropout
+    """
+    def __init__(self,in_features,hidden_features=None,out_features=None,act_layer=nn.GELU,drop=0.):
+        super().__init__()
+        # 默认保持输入输出维度一致（残差连接要求）
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        # 第1层：神经网络 Linear
+        self.fc1=nn.Linear(in_features=in_features,out_features=hidden_features)
+        # 第2层：GELU激活函数(ViT、BERT常用的激活函数)
+        self.act=act_layer()
+        # 第3层：神经网络 Linear
+        self.fc2=nn.Linear(in_features=hidden_features,out_features=out_features)
+        # 随机失活层
+        self.drop=nn.Dropout(drop)
+
+    def forward(self,x):
+        # x:[B,L,d](L相当于原理中的197，d相当于原理中的768)
+        x=self.fc1(x)
+        x=self.act(x)
+        x=self.drop(x)
+        x=self.fc2(x)
+        y=self.drop(x)
+        return y
+```
+
+
+
+
+
+## 编码器
+
+编码器对应代码中的`BLock`类
+
+![77458952634](imgs/1774589526340.png)
+
+
+
+
+
+```python
+class Block(nn.Module):
+    """
+    ViT中的Encoder 编码器
+    结构：
+        x=x+(多头注意力机制(LN(x)))
+        x=x+(前馈神经网络(LN(x)))
+    输入与输出前后形状不变 [B,L,d] L相当于原理中的197，d相当于原理中的768
+    """
+    def __init__(self,
+                 dim,       # token的维度d(相当于原理中的768)
+                 num_heads, # 多头注意力机制的头数
+                 mlp_ratio=4.,  # 前馈神经网络MLP隐藏层扩展倍数(hidden = dim*mlp_ratio)
+                 qkv_bias=False,
+                 qk_scale=None,     # qk^T矩阵相乘后缩放比重，默认是 1/sqrt(dk)
+                 drop_ratio=0.,     # Mlp随机失活比重
+                 attn_drop_ratio=0.,# 注意力机制随机失活
+                 act_layer=nn.GELU, # Mlp激活函数
+                 norm_layer=nn.LayerNorm    # 归一化层默认为层归一化
+                 ):
+        super().__init__()
+
+        # 1) 第一个 LN：给 Attention 前做归一化（Pre-LN）
+        self.norm1 = norm_layer(dim)
+
+        # 2) 多头自注意力：输入输出都是 [B,N,D]
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                              attn_drop_ratio=attn_drop_ratio, proj_drop_ratio=drop_ratio)
+
+        # 3) 第二个LN：给MLP前做归一化（Pre-LN）
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop_ratio)
+
+    def forward(self, x):
+        # x: [B, N, D]
+        # ---- Attention 子层 ----
+        # LN: [B,N,D] -> [B,N,D]
+        # MSA: [B,N,D] -> [B,N,D]
+        # Residual: x + branch
+        x = x + self.attn(self.norm1(x))
+
+        # ---- MLP 子层 ----
+        # LN: [B,N,D] -> [B,N,D]
+        # MLP: [B,N,D] -> [B,N,D]
+        x = x + self.mlp(self.norm2(x))
+        return x
+```
+
+
+
+
+
+## ViT模型整体结构实现
+
+![77431444074](imgs/1774314440748.png)
+
+![77467902249](imgs/1774679022497.png)
+
+
+
+```python
+def _init_vit_weights(m):
+    """
+    ViT 权重初始化（根据层类型分别初始化）
+    m: 传入的子模块（apply 会遍历模型里所有子模块）
+    """
+    # 1) 线性层 Linear：trunc_normal 初始化权重，bias 全 0
+    #   - trunc_normal：截断正态分布，避免极端大值，Transformer 中很常用
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=.01)   # 权重：N(0,0.01) 的截断版本
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)                 # 偏置：0
+
+    # 2) 卷积层 Conv2d：Kaiming 初始化（更适合 ReLU/卷积类）
+    #   - 这里主要影响 PatchEmbed 那个 Conv2d（以及你若加 CNN stem）
+    elif isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode="fan_out")
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    # 3) LayerNorm：weight=1，bias=0（保证一开始是“标准化但不缩放/偏移”）
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.zeros_(m.bias)
+        nn.init.ones_(m.weight)
+
+
+# ViT模型总框架
+class VisionTransformer(nn.Module):
+    def __init__(self,
+                 img_size=224,  # 图片宽高
+                 patch_size=16, # patch切块个数
+                 in_c=3,        # 输入的通常是彩色图片，因此通道数为3
+                 num_classes=1000,  # 分类数
+                 embed_dim=768, # d表示patch展平后的特征维度
+                 depth=12,      # Encoder编码器个数
+                 num_heads=12,  # 多头注意力机制的头数
+                 mlp_ratio=4.0, # 前馈神经网络MLP隐藏层扩展倍数(hidden = dim*mlp_ratio)
+                 qkv_bias=True, # W^q、W^k、W^v矩阵形成前是否需要添加偏执
+                 qk_scale=None, # qk^T矩阵相乘后缩放比重，默认是 1/sqrt(dk)
+                 representation_size=None,
+                 drop_ratio=0., # 前馈神经网络Mlp随机失活比重
+                 attn_drop_ratio=0.,    # 注意力机制随机失活
+                 embed_layer=PatchEmbed,# 模型输入层
+                 norm_layer=None,       # 归一化层
+                 act_layer=None         # 激活函数层
+                 ):
+        super().__init__()
+
+        self.num_classes=num_classes
+        self.num_features = self.embed_dim = embed_dim  # 这里num_features主要给分类头用（后面可能被 representation_size 改写）
+
+        # 默认LayerNorm（eps=1e-6）和 GELU
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        act_layer = act_layer or nn.GELU
+
+        if representation_size is None:
+            representation_size = embed_dim
+
+        # 1) Patch Embedding：图像 -> patch tokens
+        # 输出：[B, N, D]，N=196（224/16=14, 14*14=196）
+        self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_c=in_c, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        # 2) 可学习 cls token：shape [1,1,D]，forward 时 expand 成 [B,1,D]
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        # 3) 可学习绝对位置编码：shape [1, N + num_tokens, D]
+        # 标准 ViT: [1, 197, 768]
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+
+        # 对加了位置编码后的序列做dropout（正则）
+        self.pos_drop = nn.Dropout(p=drop_ratio)
+
+        # 5) Transformer Encoder：堆叠 depth 个 Block
+        self.blocks = nn.Sequential(*[
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                  drop_ratio=drop_ratio, attn_drop_ratio=attn_drop_ratio, norm_layer=norm_layer,
+                  act_layer=act_layer)
+            for _ in range(depth)])
+
+        # 最后再做一次 LayerNorm（论文也有最后的 LN）
+        self.norm = norm_layer(embed_dim)
+
+        # 加一层 Linear + Tanh
+        self.num_features = representation_size
+        self.pre_logits = nn.Sequential(OrderedDict([
+            ("fc", nn.Linear(embed_dim, representation_size)),
+            ("act", nn.Tanh())
+        ]))
+
+        # 分类头：把特征映射到类别数 K
+        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+
+        # Weight init：pos_embed / cls_token / dist_token 采用 trunc_normal(std=0.02)（常见 ViT 初始化）
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        # 对其它层按自定义 _init_vit_weights 初始化
+        self.apply(_init_vit_weights)
+
+    def forward_features(self, x):
+        # [B, C, H, W] -> [B, N, D]
+        x = self.patch_embed(x)
+
+        # [1, 1, D] -> [B, 1, D]
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+
+        # [B, N+1, D]
+        x = torch.cat((cls_token, x), dim=1)
+
+        # 加位置编码
+        x = self.pos_drop(x + self.pos_embed)
+
+        # Encoder
+        x = self.blocks(x)
+        x = self.norm(x)
+
+        # 取 cls
+        return self.pre_logits(x[:, 0])
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
+```
+
+
+
+
+
+
+
+
+
+## Base-Large-Huge三个版本的ViT
+
+**ViT的Base、Large、Huge表格区别如下：**
+
+Layers表示编码器个数，Hidden size D表示切分Patches时的卷积核个数，MLP size表示前馈神经网络中间层个数，Heads表示多头注意力机制的头数
+
+![77467909501](imgs/1774679095013.png)
+
+
+
+**对应的实例化代码如下：**
+
+Base、Large、Huge各有两个版本，两个版本的区别在于patch切分时卷积核长宽一个是16，一个是32。
+
+每个版本都有它们所对应的与训练权重，他们的链接已经放到注释中
+
+实战部分使用`vit_base_patch16_224_in21k`
+
+```python
+def vit_base_patch16_224_in21k(num_classes: int = 21843):
+    """
+    ViT-Base model (ViT-B/16) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-21k weights @ 224x224, source https://github.com/google-research/vision_transformer.
+    weights ported from official Google JAX impl:
+    https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_patch16_224_in21k-e5005f0a.pth
+    """
+    model = VisionTransformer(img_size=224,
+                              patch_size=16,
+                              embed_dim=768,
+                              depth=12,
+                              num_heads=12,
+                              representation_size=768,
+                              num_classes=num_classes)
+    return model
+
+
+def vit_base_patch32_224_in21k(num_classes: int = 21843):
+    """
+    ViT-Base model (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-21k weights @ 224x224, source https://github.com/google-research/vision_transformer.
+    weights ported from official Google JAX impl:
+    https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_base_patch32_224_in21k-8db57226.pth
+    """
+    model = VisionTransformer(img_size=224,
+                              patch_size=32,
+                              embed_dim=768,
+                              depth=12,
+                              num_heads=12,
+                              representation_size=768,
+                              num_classes=num_classes)
+    return model
+
+
+def vit_large_patch16_224_in21k(num_classes: int = 21843):
+    """
+    ViT-Large model (ViT-L/16) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-21k weights @ 224x224, source https://github.com/google-research/vision_transformer.
+    weights ported from official Google JAX impl:
+    https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_patch16_224_in21k-606da67d.pth
+    """
+    model = VisionTransformer(img_size=224,
+                              patch_size=16,
+                              embed_dim=1024,
+                              depth=24,
+                              num_heads=16,
+                              representation_size=1024,
+                              num_classes=num_classes)
+    return model
+
+
+def vit_large_patch32_224_in21k(num_classes: int = 21843):
+    """
+    ViT-Large model (ViT-L/32) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-21k weights @ 224x224, source https://github.com/google-research/vision_transformer.
+    weights ported from official Google JAX impl:
+    https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_patch32_224_in21k-9046d2e7.pth
+    """
+    model = VisionTransformer(img_size=224,
+                              patch_size=32,
+                              embed_dim=1024,
+                              depth=24,
+                              num_heads=16,
+                              representation_size=1024,
+                              num_classes=num_classes)
+    return model
+
+
+def vit_huge_patch14_224_in21k(num_classes: int = 21843):
+    """
+    ViT-Huge model (ViT-H/14) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-21k weights @ 224x224, source https://github.com/google-research/vision_transformer.
+    NOTE: converted weights not currently available, too large for github release hosting.
+    """
+    model = VisionTransformer(img_size=224,
+                              patch_size=14,
+                              embed_dim=1280,
+                              depth=32,
+                              num_heads=16,
+                              representation_size=1280,
+                              num_classes=num_classes)
+    return model
+```
+
+
+
+
 
 
 
